@@ -127,7 +127,7 @@ private[spark] object SortShuffleWriter {
   }
 }
 ```
-2.2、分析canUseSerializedShuffle，如果满足条件：<b>（1）支持序列化；（2）不需要局部聚合；（3）分区数小于16777216</b>
+2.2、分析canUseSerializedShuffle，如果满足条件：<b>（1）支持序列化<font color="red">（待分析）</font>；（2）不需要局部聚合；（3）分区数小于16777216</b>
 ```scala
   /**
    * Helper method for determining whether a shuffle should use an optimized serialized shuffle
@@ -234,6 +234,200 @@ Spark中的stage有两种，一种时ResultStage，一种时ShuffleMapStage。�
     }
   }
 ```
-5、BypassMergeSortShuffleWriter
+5、BypassMergeSortShuffleWriter  
+```java
+@Override
+  public void write(Iterator<Product2<K, V>> records) throws IOException {
+    assert (partitionWriters == null);
+    if (!records.hasNext()) {
+      partitionLengths = new long[numPartitions];
+      shuffleBlockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, null);
+      mapStatus = MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), partitionLengths);
+      return;
+    }
+    final SerializerInstance serInstance = serializer.newInstance();
+    final long openStartTime = System.nanoTime();
+    // 构建一个对于task结果对应分区数量的write数组，即一个分区对应一个writer
+    // 对于这种写入方式，会同时打开numPartition个writer，所以分区数量不宜过大，避免带来国中的内存开销
+    // 现在默认writer的缓存大小时32k
+    partitionWriters = new DiskBlockObjectWriter[numPartitions];
+    // 创建FileSegment数组，一个分区的writer对应一组FileSegment
+    partitionWriterSegments = new FileSegment[numPartitions];
+    for (int i = 0; i < numPartitions; i++) {
+      // 创建临时的shuffle block,返回一个(shuffle blockid, file)数组
+      final Tuple2<TempShuffleBlockId, File> tempShuffleBlockIdPlusFile =
+        blockManager.diskBlockManager().createTempShuffleBlock();
+      // 获取该分区对应的文件
+      final File file = tempShuffleBlockIdPlusFile._2();
+      // 获取该分区对应的blockid
+      final BlockId blockId = tempShuffleBlockIdPlusFile._1();
+      // 构造每一个分区的writer
+      partitionWriters[i] =
+        blockManager.getDiskWriter(blockId, file, serInstance, fileBufferSize, writeMetrics);
+    }
+    // Creating the file to write to and creating a disk writer both involve interacting with
+    // the disk, and can take a long time in aggregate when we open many files, so should be
+    // included in the shuffle write time.
+    writeMetrics.incWriteTime(System.nanoTime() - openStartTime);
+
+    // 如果有数据，获取数据，对key进行分区，然后将<key,value>写入该分区对应的文件
+    while (records.hasNext()) {
+      final Product2<K, V> record = records.next();
+      final K key = record._1();
+      partitionWriters[partitioner.getPartition(key)].write(key, record._2());
+    }
+
+    // 遍历所有分区的writer列表，刷新数据到文件，构建FileSegment数组
+    for (int i = 0; i < numPartitions; i++) {
+      final DiskBlockObjectWriter writer = partitionWriters[i];
+      // 把数据刷到磁盘，构建一个FileSegment
+      partitionWriterSegments[i] = writer.commitAndGet();
+      writer.close();
+    }
+
+    // 根据shuffleId和mapId，构建ShuffleDataBlockId，创建文件，格式为
+    //shuffle_{shuffleId}_{mapId}_{reduceId}.data
+    File output = shuffleBlockResolver.getDataFile(shuffleId, mapId);
+    // 创建临时文件
+    File tmp = Utils.tempFileWith(output);
+    try {
+      // 合并前面生成的各个中间临时文件，并获取分区对应的数据大小，然后开始计算偏移量
+      partitionLengths = writePartitionedFile(tmp);
+      // 创建索引文件，将每一个分区的起始位置、结束位置和偏移量写入索引
+      // 且将合并的data临时文件重命名，索引文件的临时文件重命名
+      shuffleBlockResolver.writeIndexFileAndCommit(shuffleId, mapId, partitionLengths, tmp);
+    } finally {
+      if (tmp.exists() && !tmp.delete()) {
+        logger.error("Error while deleting temp file {}", tmp.getAbsolutePath());
+      }
+    }
+    // 封装并返回任何结果
+    mapStatus = MapStatus$.MODULE$.apply(blockManager.shuffleServerId(), partitionLengths);
+  }
+```
+5.1、writePartitionedFile合并所有分区的文件，并获取每个分区文件的大小
+```java
+/**
+   * Concatenate all of the per-partition files into a single combined file.
+   *
+   * @return array of lengths, in bytes, of each partition of the file (used by map output tracker).
+   */
+  private long[] writePartitionedFile(File outputFile) throws IOException {
+    // Track location of the partition starts in the output file
+    // 构建一个分区数量大小的数组
+    final long[] lengths = new long[numPartitions];
+    if (partitionWriters == null) {
+      // We were passed an empty iterator
+      return lengths;
+    }
+
+    // 创建合并文件的临时文件输出流
+    final FileOutputStream out = new FileOutputStream(outputFile, true);
+    final long writeStartTime = System.nanoTime();
+    boolean threwException = true;
+    try {
+      // 合并分区文件，返回每一个分区文件长度
+      for (int i = 0; i < numPartitions; i++) {
+        // 获取该分区对应的FileSegment对应的文件
+        final File file = partitionWriterSegments[i].file();
+        // 如果文件存在
+        if (file.exists()) {
+          final FileInputStream in = new FileInputStream(file);
+          boolean copyThrewException = true;
+          try {
+            // 把文件复制到临时文件中，并返回文件长度
+            lengths[i] = Utils.copyStream(in, out, false, transferToEnabled);
+            copyThrewException = false;
+          } finally {
+            Closeables.close(in, copyThrewException);
+          }
+          if (!file.delete()) {
+            logger.error("Unable to delete file for partition {}", i);
+          }
+        }
+      }
+      threwException = false;
+    } finally {
+      Closeables.close(out, threwException);
+      writeMetrics.incWriteTime(System.nanoTime() - writeStartTime);
+    }
+    partitionWriters = null;
+    return lengths;
+  }
+```
+5.2、writeIndexFileAndCommit创建文件索引
+```scala
+/**
+   * Write an index file with the offsets of each block, plus a final offset at the end for the
+   * end of the output file. This will be used by getBlockData to figure out where each block
+   * begins and ends.
+   *
+   * It will commit the data and index file as an atomic operation, use the existing ones, or
+   * replace them with new ones.
+   *
+   * Note: the `lengths` will be updated to match the existing index file if use the existing ones.
+   */
+  def writeIndexFileAndCommit(
+      shuffleId: Int,
+      mapId: Int,
+      lengths: Array[Long],
+      dataTmp: File): Unit = {
+    // 获取索引文件
+    val indexFile = getIndexFile(shuffleId, mapId)
+    // 临时的索引文件
+    val indexTmp = Utils.tempFileWith(indexFile)
+    try {
+      // 获取数据文件
+      val dataFile = getDataFile(shuffleId, mapId)
+      // There is only one IndexShuffleBlockResolver per executor, this synchronization make sure
+      // the following check and rename are atomic.
+      synchronized {
+        // 传递索引、数据文件以及分区数，校验准确性
+        val existingLengths = checkIndexAndDataFile(indexFile, dataFile, lengths.length)
+        if (existingLengths != null) {
+          // Another attempt for the same task has already written our map outputs successfully,
+          // so just use the existing partition lengths and delete our temporary map outputs.
+          System.arraycopy(existingLengths, 0, lengths, 0, lengths.length)
+          if (dataTmp != null && dataTmp.exists()) {
+            dataTmp.delete()
+          }
+        } else {
+          // This is the first successful attempt in writing the map outputs for this task,
+          // so override any existing index and data files with the ones we wrote.
+          val out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(indexTmp)))
+          Utils.tryWithSafeFinally {
+            // We take in lengths of each block, need to convert it to offsets.
+            // 将offset写入临时的索引文件
+            var offset = 0L
+            out.writeLong(offset)
+            for (length <- lengths) {
+              offset += length
+              out.writeLong(offset)
+            }
+          } {
+            out.close()
+          }
+
+          if (indexFile.exists()) {
+            indexFile.delete()
+          }
+          if (dataFile.exists()) {
+            dataFile.delete()
+          }
+          if (!indexTmp.renameTo(indexFile)) {
+            throw new IOException("fail to rename file " + indexTmp + " to " + indexFile)
+          }
+          if (dataTmp != null && dataTmp.exists() && !dataTmp.renameTo(dataFile)) {
+            throw new IOException("fail to rename file " + dataTmp + " to " + dataFile)
+          }
+        }
+      }
+    } finally {
+      if (indexTmp.exists() && !indexTmp.delete()) {
+        logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+      }
+    }
+  }
+```
 6、
 </ol>
